@@ -25,8 +25,8 @@ from flask_cors import CORS
 
 # ------------------ الإعدادات ------------------
 # جلب التوكن من متغيرات البيئة أو استخدام القيمة الافتراضية
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8941591490:AAE_HP_z4z7Ls0nEsalTqLI1dYsg4TYdOL4")
-ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", 5437487652))
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "9154524424:AAGc3lOaznU7eMV-aQEm-eHHJmZDmX4K9KE")
+ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", 8992323424))
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 app = Flask(__name__)
