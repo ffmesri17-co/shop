@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: jawaker-store-backend
+    runtime: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_CHAT_ID
+        sync: false
+      - key: NOWPAYMENTS_API_KEY
+        sync: false
+      - key: NOWPAYMENTS_IPN_SECRET
+        sync: false
+      - key: PUBLIC_BASE_URL
+        sync: false
+      - key: KEEP_ALIVE_ENABLED
+        value: "true"
+```[cite: 4]
+
+انسخه مباشرة إلى ملف `render.yaml` في مستودع الباك-إند على GitHub[cite: 4].
